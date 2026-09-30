@@ -20,6 +20,9 @@ cargo run -- run \
 Configure the application to connect to `127.0.0.1:9000` instead of the server
 at `127.0.0.1:8080`. `--listen` defaults to `127.0.0.1:9000`. Add
 `--disconnect-after 30s` to close each accepted session after 30 seconds.
+The local dashboard is available at `http://127.0.0.1:9001/` by default; use
+`--dashboard` to change its address. It shows live connection totals and bytes
+forwarded in each direction. Its JSON endpoint is `/api/metrics`.
 
 ## Simulated conditions
 
@@ -44,6 +47,8 @@ precise transport benchmarking.
 ## Build
 
 ```sh
+npm install
+npm run build
 cargo build --release
 cargo test
 ```

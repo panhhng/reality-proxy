@@ -1,0 +1,11 @@
+{
+  "name": "reality-proxy-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "tsc --project tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

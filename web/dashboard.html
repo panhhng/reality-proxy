@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101715">
+    <title>Reality Proxy</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --ink: #e9f0e9;
+            --muted: #9baaa2;
+            --line: #34433c;
+            --surface: #19231f;
+            --surface-raised: #202d27;
+            --green: #b9f27c;
+            --orange: #ffae70;
+            --red: #ff8178;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            color: var(--ink);
+            background:
+                radial-gradient(ellipse at 82% 0%, #304038 0, transparent 34rem),
+                repeating-linear-gradient(135deg, #ffffff03 0 1px, transparent 1px 24px),
+                #101715;
+            font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+        main { width: min(1060px, calc(100% - 40px)); margin: 0 auto; padding: 42px 0 64px; }
+        header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; border-bottom: 1px solid var(--line); padding-bottom: 28px; }
+        .eyebrow { color: var(--green); text-transform: uppercase; font-size: 11px; letter-spacing: 1.2px; }
+        h1 { margin: 8px 0 4px; font: 600 32px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .subtitle { color: var(--muted); margin: 0; }
+        .status { display: flex; align-items: center; gap: 9px; color: var(--green); white-space: nowrap; padding-top: 8px; }
+        .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 16px #b9f27c77; }
+        .settings { display: flex; flex-wrap: wrap; gap: 10px 24px; padding: 18px 0 24px; color: var(--muted); font-size: 12px; }
+        .settings strong { color: var(--ink); font-weight: 500; }
+        .section-title { display: flex; justify-content: space-between; align-items: baseline; margin: 14px 0 12px; }
+        h2 { font-size: 13px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin: 0; }
+        #updated { color: var(--muted); font-size: 11px; }
+        .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); background: #19231fd9; }
+        .metric { padding: 20px; min-height: 118px; border-right: 1px solid var(--line); }
+        .metric:last-child { border-right: 0; }
+        .metric-label { display: block; font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: .7px; }
+        .metric-value { display: block; font-size: 30px; line-height: 1.2; margin-top: 12px; font-variant-numeric: tabular-nums; }
+        .metric-value.green { color: var(--green); }
+        .metric-value.orange { color: var(--orange); }
+        .traffic { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); margin-top: 22px; }
+        .direction { padding: 18px 20px; background: var(--surface); }
+        .direction-head { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
+        .direction strong { color: var(--ink); font-size: 19px; font-weight: 500; font-variant-numeric: tabular-nums; }
+        .bar { height: 4px; background: #34433c; margin-top: 14px; overflow: hidden; }
+        .bar span { display: block; width: 0; height: 100%; background: var(--green); transition: width .25s ease; }
+        .bar.down span { background: var(--orange); }
+        .bottom { display: grid; grid-template-columns: 1.4fr 1fr; gap: 22px; margin-top: 22px; }
+        .panel { border-top: 1px solid var(--line); padding-top: 16px; }
+        .panel p { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+        .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-top: 18px; }
+        .button { color: #142012; background: var(--green); text-decoration: none; padding: 10px 14px; font-size: 12px; font-weight: 700; border: 0; cursor: pointer; }
+        .button:hover { background: #d0ffa0; }
+        .quiet-link { color: var(--muted); font-size: 12px; }
+        @media (max-width: 680px) {
+            main { width: min(100% - 28px, 520px); padding-top: 28px; }
+            header { flex-direction: column; gap: 8px; }
+            h1 { font-size: 26px; }
+            .metrics { grid-template-columns: 1fr 1fr; }
+            .metric { border-bottom: 1px solid var(--line); }
+            .metric:nth-child(2) { border-right: 0; }
+            .metric:nth-child(n+3) { border-bottom: 0; }
+            .traffic, .bottom { grid-template-columns: 1fr; }
+            .direction-head { align-items: baseline; }
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <header>
+            <div>
+                <div class="eyebrow">Alternate-Reality Network / local monitor</div>
+                <h1>Reality Proxy</h1>
+                <p class="subtitle">Live view of the TCP traffic passing through this run.</p>
+            </div>
+            <div class="status"><span class="dot"></span><span>PROXY RUNNING</span></div>
+        </header>
+
+        <section class="settings" aria-label="Active network conditions">
+            <span>LISTEN <strong id="listen">--</strong></span>
+            <span>UPSTREAM <strong id="target">--</strong></span>
+            <span>LATENCY <strong id="latency">--</strong></span>
+            <span>LIMIT <strong id="bandwidth">--</strong></span>
+            <span>REJECT <strong id="drop-rate">--</strong></span>
+        </section>
+
+        <div class="section-title"><h2>Connections</h2><span id="updated">Waiting for metrics</span></div>
+        <section class="metrics" aria-live="polite">
+            <div class="metric"><span class="metric-label">Active now</span><strong class="metric-value green" id="active">0</strong></div>
+            <div class="metric"><span class="metric-label">Accepted total</span><strong class="metric-value" id="accepted">0</strong></div>
+            <div class="metric"><span class="metric-label">Rejected total</span><strong class="metric-value orange" id="rejected">0</strong></div>
+            <div class="metric"><span class="metric-label">Simulated drops</span><strong class="metric-value" id="disconnects">0</strong></div>
+        </section>
+
+        <div class="section-title" style="margin-top:26px"><h2>Traffic moved</h2><span id="total">0 B total</span></div>
+        <section class="traffic">
+            <div class="direction">
+                <div class="direction-head"><span>CLIENT → SERVER</span><strong id="upload">0 B</strong></div>
+                <div class="bar"><span id="upload-bar"></span></div>
+            </div>
+            <div class="direction">
+                <div class="direction-head"><span>SERVER → CLIENT</span><strong id="download">0 B</strong></div>
+                <div class="bar down"><span id="download-bar"></span></div>
+            </div>
+        </section>
+
+        <section class="bottom">
+            <div class="panel">
+                <h2>Try a request</h2>
+                <p>Open the upstream through the proxy. Come back here to watch connection totals and bytes move.</p>
+                <div class="actions">
+                    <a class="button" id="test-link" href="/" target="_blank" rel="noreferrer">OPEN PROXIED UPSTREAM ↗</a>
+                    <a class="quiet-link" href="/api/metrics" target="_blank" rel="noreferrer">View raw metrics JSON</a>
+                </div>
+            </div>
+            <div class="panel">
+                <h2>What you’re seeing</h2>
+                <p>Counts describe TCP connections and bytes, not HTTP requests. Latency and throughput shaping operate on TCP stream chunks.</p>
+            </div>
+        </section>
+    </main>
+    <script src="/dashboard.js" defer></script>
+</body>
+</html>

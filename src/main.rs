@@ -1,13 +1,24 @@
 use std::{
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use anyhow::Context;
+use axum::{
+    extract::State,
+    http::header,
+    response::{Html, IntoResponse},
+    routing::get,
+    Json, Router,
+};
 use clap::{Parser, Subcommand};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use serde::Serialize;
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -37,6 +48,10 @@ struct RunArgs {
     /// Local address the application should connect to.
     #[arg(long, default_value = "127.0.0.1:9000")]
     listen: SocketAddr,
+
+    /// Local address for the metrics dashboard and JSON API.
+    #[arg(long, default_value = "127.0.0.1:9001")]
+    dashboard: SocketAddr,
 
     /// Address of the real upstream server.
     #[arg(long)]
@@ -71,6 +86,62 @@ struct ProxyConfig {
     disconnect_after: Option<Duration>,
 }
 
+#[derive(Default)]
+struct Metrics {
+    active_connections: AtomicU64,
+    accepted_connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    simulated_disconnects: AtomicU64,
+    client_to_server_bytes: Arc<AtomicU64>,
+    server_to_client_bytes: Arc<AtomicU64>,
+    listen_address: String,
+    target_address: String,
+    latency_ms: u64,
+    bandwidth_bytes_per_second: Option<f64>,
+    drop_rate_percent: f64,
+}
+
+#[derive(Serialize)]
+struct MetricsSnapshot {
+    active_connections: u64,
+    accepted_connections: u64,
+    rejected_connections: u64,
+    simulated_disconnects: u64,
+    client_to_server_bytes: u64,
+    server_to_client_bytes: u64,
+    listen_address: String,
+    target_address: String,
+    latency_ms: u64,
+    bandwidth_bytes_per_second: Option<f64>,
+    drop_rate_percent: f64,
+}
+
+impl Metrics {
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            active_connections: self.active_connections.load(Ordering::Relaxed),
+            accepted_connections: self.accepted_connections.load(Ordering::Relaxed),
+            rejected_connections: self.rejected_connections.load(Ordering::Relaxed),
+            simulated_disconnects: self.simulated_disconnects.load(Ordering::Relaxed),
+            client_to_server_bytes: self.client_to_server_bytes.load(Ordering::Relaxed),
+            server_to_client_bytes: self.server_to_client_bytes.load(Ordering::Relaxed),
+            listen_address: self.listen_address.clone(),
+            target_address: self.target_address.clone(),
+            latency_ms: self.latency_ms,
+            bandwidth_bytes_per_second: self.bandwidth_bytes_per_second,
+            drop_rate_percent: self.drop_rate_percent,
+        }
+    }
+}
+
+struct ActiveConnection(Arc<Metrics>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
 
 impl<T> Drop for AbortOnDrop<T> {
@@ -93,6 +164,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("could not listen on {}", args.listen))?;
+    let dashboard_listener = TcpListener::bind(args.dashboard)
+        .await
+        .with_context(|| format!("could not start dashboard on {}", args.dashboard))?;
     let config = Arc::new(ProxyConfig {
         target: args.target,
         latency: args.latency,
@@ -104,11 +178,30 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
     }));
+    let metrics = Arc::new(Metrics {
+        listen_address: args.listen.to_string(),
+        target_address: args.target.to_string(),
+        latency_ms: args.latency.as_millis() as u64,
+        bandwidth_bytes_per_second: args.bandwidth,
+        drop_rate_percent: args.drop_rate,
+        ..Metrics::default()
+    });
+    let dashboard = Router::new()
+        .route("/", get(dashboard_page))
+        .route("/dashboard.js", get(dashboard_script))
+        .route("/api/metrics", get(metrics_api))
+        .with_state(Arc::clone(&metrics));
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(dashboard_listener, dashboard).await {
+            eprintln!("dashboard server stopped: {error}");
+        }
+    });
 
     println!(
         "listening on {}; forwarding to {}",
         args.listen, args.target
     );
+    println!("dashboard: http://{}/", args.dashboard);
     println!(
         "latency: {:?}, bandwidth: {}, connection drop rate: {:.1}%",
         args.latency,
@@ -123,12 +216,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             accepted = listener.accept() => {
                 let (client, peer) = accepted?;
                 let config = Arc::clone(&config);
+                let metrics = Arc::clone(&metrics);
                 let should_drop = rng
                     .lock()
                     .expect("random number generator mutex poisoned")
                     .gen_bool(config.drop_probability);
+                metrics.accepted_connections.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(client, peer, config, should_drop).await {
+                    if let Err(error) =
+                        handle_connection(client, peer, config, metrics, should_drop).await
+                    {
                         eprintln!("{peer}: {error:#}");
                     }
                 });
@@ -147,9 +244,11 @@ async fn handle_connection(
     client: TcpStream,
     peer: SocketAddr,
     config: Arc<ProxyConfig>,
+    metrics: Arc<Metrics>,
     should_drop: bool,
 ) -> anyhow::Result<()> {
     if should_drop {
+        metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
         eprintln!("{peer}: rejected by simulated connection drop");
         return Ok(());
     }
@@ -157,6 +256,8 @@ async fn handle_connection(
     let upstream = TcpStream::connect(config.target)
         .await
         .with_context(|| format!("could not connect to upstream {}", config.target))?;
+    metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _active_connection = ActiveConnection(Arc::clone(&metrics));
     let (client_read, client_write) = split(client);
     let (upstream_read, upstream_write) = split(upstream);
     let transfer = async {
@@ -166,12 +267,14 @@ async fn handle_connection(
                 upstream_write,
                 config.latency,
                 config.bandwidth_bytes_per_second,
+                Arc::clone(&metrics.client_to_server_bytes),
             ),
             copy_with_reality(
                 upstream_read,
                 client_write,
                 config.latency,
                 config.bandwidth_bytes_per_second,
+                Arc::clone(&metrics.server_to_client_bytes),
             ),
         )?;
         Ok::<(), io::Error>(())
@@ -181,7 +284,12 @@ async fn handle_connection(
         Some(duration) => {
             tokio::select! {
                 result = transfer => result.context("TCP forwarding failed")?,
-                _ = sleep(duration) => eprintln!("{peer}: disconnected by simulation timer"),
+                _ = sleep(duration) => {
+                    metrics
+                        .simulated_disconnects
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!("{peer}: disconnected by simulation timer");
+                },
             }
         }
         None => transfer.await.context("TCP forwarding failed")?,
@@ -194,6 +302,7 @@ async fn copy_with_reality<R, W>(
     mut writer: W,
     latency: Duration,
     bandwidth_bytes_per_second: Option<f64>,
+    forwarded_bytes: Arc<AtomicU64>,
 ) -> io::Result<u64>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -230,6 +339,7 @@ where
         sleep_until(send_at).await;
         writer.write_all(&chunk).await?;
         forwarded += chunk.len() as u64;
+        forwarded_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
     }
     writer.shutdown().await?;
     reader_task
@@ -240,6 +350,24 @@ where
         .map_err(io::Error::other)??;
     Ok(forwarded)
 }
+
+async fn dashboard_page() -> Html<&'static str> {
+    Html(DASHBOARD_HTML)
+}
+
+async fn dashboard_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        DASHBOARD_SCRIPT,
+    )
+}
+
+async fn metrics_api(State(metrics): State<Arc<Metrics>>) -> Json<MetricsSnapshot> {
+    Json(metrics.snapshot())
+}
+
+const DASHBOARD_HTML: &str = include_str!("../web/dashboard.html");
+const DASHBOARD_SCRIPT: &str = include_str!("../web/dist/dashboard.js");
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
     humantime::parse_duration(value).map_err(|error| error.to_string())
@@ -333,9 +461,11 @@ mod tests {
         });
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = proxy_listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let connection_metrics = Arc::clone(&metrics);
         let client_task = tokio::spawn(async move {
             let (proxy_client, peer) = proxy_listener.accept().await.unwrap();
-            handle_connection(proxy_client, peer, proxy_config, false)
+            handle_connection(proxy_client, peer, proxy_config, connection_metrics, false)
                 .await
                 .unwrap();
         });
@@ -352,6 +482,9 @@ mod tests {
         client.shutdown().await.unwrap();
         upstream_task.await.unwrap();
         client_task.await.unwrap();
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.client_to_server_bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(metrics.server_to_client_bytes.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]
@@ -363,6 +496,7 @@ mod tests {
             proxy_writer,
             Duration::ZERO,
             Some(100.0),
+            Arc::new(AtomicU64::default()),
         ));
 
         let started = Instant::now();
@@ -380,6 +514,8 @@ mod tests {
     async fn rejected_connection_closes_without_connecting_upstream() {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = proxy_listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let connection_metrics = Arc::clone(&metrics);
         let proxy_task = tokio::spawn(async move {
             let (proxy_client, peer) = proxy_listener.accept().await.unwrap();
             let config = Arc::new(ProxyConfig {
@@ -389,7 +525,7 @@ mod tests {
                 drop_probability: 1.0,
                 disconnect_after: None,
             });
-            handle_connection(proxy_client, peer, config, true)
+            handle_connection(proxy_client, peer, config, connection_metrics, true)
                 .await
                 .unwrap();
         });
@@ -400,6 +536,7 @@ mod tests {
 
         assert!(received.is_empty());
         proxy_task.await.unwrap();
+        assert_eq!(metrics.rejected_connections.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -414,6 +551,8 @@ mod tests {
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = proxy_listener.local_addr().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let connection_metrics = Arc::clone(&metrics);
         let proxy_task = tokio::spawn(async move {
             let (proxy_client, peer) = proxy_listener.accept().await.unwrap();
             let config = Arc::new(ProxyConfig {
@@ -423,7 +562,7 @@ mod tests {
                 drop_probability: 0.0,
                 disconnect_after: Some(Duration::from_millis(30)),
             });
-            handle_connection(proxy_client, peer, config, false)
+            handle_connection(proxy_client, peer, config, connection_metrics, false)
                 .await
                 .unwrap();
         });
@@ -438,5 +577,7 @@ mod tests {
         assert!(received.is_empty());
         proxy_task.await.unwrap();
         upstream_task.await.unwrap();
+        assert_eq!(metrics.simulated_disconnects.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
     }
 }

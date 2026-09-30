@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "None",
+    "lib": ["ES2020", "DOM"],
+    "strict": true,
+    "noEmitOnError": true,
+    "rootDir": "web",
+    "outDir": "web/dist",
+    "skipLibCheck": true
+  },
+  "include": ["web/dashboard.ts"]
+}
