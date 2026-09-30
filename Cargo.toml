@@ -1,0 +1,16 @@
+[package]
+name = "alternate-reality"
+version = "0.1.0"
+edition = "2021"
+description = "An application-level TCP proxy for simulating hostile network conditions"
+
+[[bin]]
+name = "reality"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
