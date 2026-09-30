@@ -11,11 +11,16 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    time::sleep,
+    sync::mpsc,
+    time::{sleep, sleep_until, Instant},
 };
 
 #[derive(Parser)]
-#[command(name = "reality", version, about = "Simulate hostile TCP network conditions")]
+#[command(
+    name = "reality",
+    version,
+    about = "Simulate hostile TCP network conditions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -37,7 +42,7 @@ struct RunArgs {
     #[arg(long)]
     target: SocketAddr,
 
-    /// One-way delay added to each stream before its first bytes are forwarded.
+    /// One-way delay applied to each TCP stream chunk as it is forwarded.
     #[arg(long, default_value = "0ms", value_parser = parse_duration)]
     latency: Duration,
 
@@ -66,6 +71,16 @@ struct ProxyConfig {
     disconnect_after: Option<Duration>,
 }
 
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -90,7 +105,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         None => StdRng::from_entropy(),
     }));
 
-    println!("listening on {}; forwarding to {}", args.listen, args.target);
+    println!(
+        "listening on {}; forwarding to {}",
+        args.listen, args.target
+    );
     println!(
         "latency: {:?}, bandwidth: {}, connection drop rate: {:.1}%",
         args.latency,
@@ -126,7 +144,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 }
 
 async fn handle_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     peer: SocketAddr,
     config: Arc<ProxyConfig>,
     should_drop: bool,
@@ -178,28 +196,49 @@ async fn copy_with_reality<R, W>(
     bandwidth_bytes_per_second: Option<f64>,
 ) -> io::Result<u64>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    if !latency.is_zero() {
-        sleep(latency).await;
-    }
+    let (sender, mut receiver) = mpsc::channel::<(Instant, Vec<u8>)>(64);
+    let mut reader_task = AbortOnDrop(Some(tokio::spawn(async move {
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let bytes_read = reader.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                return Ok::<(), io::Error>(());
+            }
+            let send_at = Instant::now() + latency;
+            sender
+                .send((send_at, buffer[..bytes_read].to_vec()))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "forwarder stopped"))?;
+        }
+    })));
 
-    let mut buffer = [0_u8; 16 * 1024];
     let mut forwarded = 0_u64;
-    loop {
-        let bytes_read = reader.read(&mut buffer).await?;
-        if bytes_read == 0 {
-            writer.shutdown().await?;
-            return Ok(forwarded);
-        }
-        writer.write_all(&buffer[..bytes_read]).await?;
-        forwarded += bytes_read as u64;
-
-        if let Some(rate) = bandwidth_bytes_per_second {
-            sleep(Duration::from_secs_f64(bytes_read as f64 / rate)).await;
-        }
+    let mut bandwidth_ready_at = Instant::now();
+    while let Some((send_at, chunk)) = receiver.recv().await {
+        let send_at = if let Some(rate) = bandwidth_bytes_per_second {
+            let transmission_start = send_at.max(bandwidth_ready_at);
+            let transmission_end =
+                transmission_start + Duration::from_secs_f64(chunk.len() as f64 / rate);
+            bandwidth_ready_at = transmission_end;
+            transmission_end
+        } else {
+            send_at
+        };
+        sleep_until(send_at).await;
+        writer.write_all(&chunk).await?;
+        forwarded += chunk.len() as u64;
     }
+    writer.shutdown().await?;
+    reader_task
+        .0
+        .take()
+        .expect("reader task is present")
+        .await
+        .map_err(io::Error::other)??;
+    Ok(forwarded)
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -250,4 +289,154 @@ fn parse_bandwidth(value: &str) -> Result<f64, String> {
         return Err("bandwidth must be greater than zero".to_owned());
     }
     Ok(bytes_per_second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn parses_bandwidth_units() {
+        assert_eq!(parse_bandwidth("2mbit").unwrap(), 250_000.0);
+        assert_eq!(parse_bandwidth("256KB/s").unwrap(), 256_000.0);
+        assert!(parse_bandwidth("0mbit").is_err());
+    }
+
+    #[test]
+    fn validates_drop_percentages() {
+        assert_eq!(parse_percentage("5%").unwrap(), 5.0);
+        assert_eq!(parse_percentage("100").unwrap(), 100.0);
+        assert!(parse_percentage("101%").is_err());
+        assert!(parse_percentage("-1%").is_err());
+    }
+
+    #[tokio::test]
+    async fn forwards_both_directions_with_latency() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = [0; 4];
+            upstream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            upstream.write_all(b"pong").await.unwrap();
+        });
+
+        let latency = Duration::from_millis(40);
+        let proxy_config = Arc::new(ProxyConfig {
+            target: upstream_address,
+            latency,
+            bandwidth_bytes_per_second: None,
+            drop_probability: 0.0,
+            disconnect_after: None,
+        });
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let (proxy_client, peer) = proxy_listener.accept().await.unwrap();
+            handle_connection(proxy_client, peer, proxy_config, false)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        let started = tokio::time::Instant::now();
+        client.write_all(b"ping").await.unwrap();
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+
+        assert_eq!(&response, b"pong");
+        assert!(started.elapsed() >= latency * 2);
+
+        client.shutdown().await.unwrap();
+        upstream_task.await.unwrap();
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limit_paces_data_before_delivery() {
+        let (mut client_writer, proxy_reader) = tokio::io::duplex(64);
+        let (proxy_writer, mut client_reader) = tokio::io::duplex(64);
+        let transfer = tokio::spawn(copy_with_reality(
+            proxy_reader,
+            proxy_writer,
+            Duration::ZERO,
+            Some(100.0),
+        ));
+
+        let started = Instant::now();
+        client_writer.write_all(b"1234567890").await.unwrap();
+        client_writer.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_reader.read_to_end(&mut received).await.unwrap();
+
+        assert_eq!(&received, b"1234567890");
+        assert!(started.elapsed() >= Duration::from_millis(90));
+        transfer.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_connection_closes_without_connecting_upstream() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (proxy_client, peer) = proxy_listener.accept().await.unwrap();
+            let config = Arc::new(ProxyConfig {
+                target: "127.0.0.1:1".parse().unwrap(),
+                latency: Duration::ZERO,
+                bandwidth_bytes_per_second: None,
+                drop_probability: 1.0,
+                disconnect_after: None,
+            });
+            handle_connection(proxy_client, peer, config, true)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+
+        assert!(received.is_empty());
+        proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_timer_closes_established_tunnel() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = upstream_listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            upstream.read_to_end(&mut received).await.unwrap();
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (proxy_client, peer) = proxy_listener.accept().await.unwrap();
+            let config = Arc::new(ProxyConfig {
+                target: upstream_address,
+                latency: Duration::ZERO,
+                bandwidth_bytes_per_second: None,
+                drop_probability: 0.0,
+                disconnect_after: Some(Duration::from_millis(30)),
+            });
+            handle_connection(proxy_client, peer, config, false)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(received.is_empty());
+        proxy_task.await.unwrap();
+        upstream_task.await.unwrap();
+    }
 }

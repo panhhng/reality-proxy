@@ -23,9 +23,11 @@ at `127.0.0.1:8080`. `--listen` defaults to `127.0.0.1:9000`. Add
 
 ## Simulated conditions
 
-- `--latency 300ms` adds a one-way delay before the first bytes in each
-  direction are forwarded. Both directions are delayed, so the added
-  request/response round-trip time is approximately twice this value.
+- `--latency 300ms` delays each read chunk by 300 ms in each direction while
+  preserving TCP byte order. A request/response round trip therefore adds
+  approximately twice this value. TCP stream chunks are not application
+  messages or IP packets, so this is an approximation rather than precise
+  per-request or packet-level latency.
 - `--bandwidth 2mbit` caps each direction independently. Rates support bit
   suffixes such as `mbit`/`Mbps` and byte suffixes such as `KB/s`/`MB/s`.
 - `--drop-rate 5%` rejects a proportion of new TCP connections. `--seed`
@@ -35,12 +37,13 @@ at `127.0.0.1:8080`. `--listen` defaults to `127.0.0.1:9000`. Add
 
 This version operates on TCP byte streams, not IP packets. Connection rejection
 is not packet loss, and it does not implement packet duplication, reordering,
-UDP, DNS faults, or scenario files yet. Bandwidth pacing is applied to chunks
-after they are forwarded, so it is intended for application testing rather
-than precise transport benchmarking.
+UDP, DNS faults, or scenario files yet. Bandwidth is paced per stream chunk;
+TCP chunk boundaries vary, so use it for application testing rather than
+precise transport benchmarking.
 
 ## Build
 
 ```sh
 cargo build --release
+cargo test
 ```
